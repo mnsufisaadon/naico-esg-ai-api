@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/esg-advisor.js": {
-      "maxDuration": 30
-    }
-  }
-}
