@@ -2,34 +2,43 @@ import OpenAI from "openai";
 
 const MODEL = process.env.OPENAI_MODEL || "gpt-5.5-mini";
 
-function setCors(req, res) {
-  const origin = req.headers.origin || "*";
-
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-function isObj(v) {
-  return v && typeof v === "object" && !Array.isArray(v);
-}
-
-function isNum(v) {
-  return typeof v === "number" && Number.isFinite(v);
-}
-
-function get(obj, paths) {
-  for (const path of paths) {
+function get(obj, pathList) {
+  for (const path of pathList) {
     const value = path.split(".").reduce((acc, key) => acc?.[key], obj);
     if (value !== undefined && value !== null) return value;
   }
   return undefined;
 }
 
+function toNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+
+  if (typeof value === "string") {
+    const cleaned = value
+      .trim()
+      .replace(/,/g, "")
+      .replace(/\s*Gt\s*$/i, "")
+      .replace(/\s*%\s*$/i, "");
+
+    const normal = Number(cleaned);
+    if (Number.isFinite(normal)) return normal;
+
+    const sci = cleaned.match(/^([+-]?\d+(?:\.\d+)?)\s*[×x]\s*10\^?([+-]?\d+)$/i);
+    if (sci) return Number(sci[1]) * Math.pow(10, Number(sci[2]));
+  }
+
+  return null;
+}
+
 function getNumber(obj, paths) {
-  const value = get(obj, paths);
-  return isNum(value) ? value : null;
+  return toNumber(get(obj, paths));
 }
 
 function getString(obj, paths) {
@@ -50,26 +59,30 @@ function getSbtiDelta(payload) {
 function getSbtiStatus(payload) {
   const status = getString(payload, [
     "sbtiMilestone.status",
+    "sbtiMilestone.position",
     "sbti.status"
   ]);
 
-  if (status) return status.toLowerCase();
+  if (status) {
+    const s = status.toLowerCase();
+    if (s.includes("ahead")) return "ahead";
+    if (s.includes("behind")) return "behind";
+    if (s.includes("track") || s.includes("meet")) return "on-track";
+  }
 
   const delta = getSbtiDelta(payload);
-
-  if (!isNum(delta)) return "unknown";
+  if (typeof delta !== "number") return "unknown";
   if (delta > 0) return "ahead";
   if (delta < 0) return "behind";
   return "on-track";
 }
 
-function validateEsgPayload(payload) {
-  if (!isObj(payload)) {
+function validatePayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return { ok: false, message: "Payload must be a JSON object." };
   }
 
-  const payloadSize = JSON.stringify(payload).length;
-  if (payloadSize > 45000) {
+  if (JSON.stringify(payload).length > 45000) {
     return { ok: false, message: "Payload is too large." };
   }
 
@@ -91,18 +104,21 @@ function validateEsgPayload(payload) {
   const environmentalScore = getNumber(payload, [
     "readiness.environmentalScore",
     "readiness.pillars.environmental",
+    "readiness.pillarScores.environmental",
     "esgScores.environmental"
   ]);
 
   const socialScore = getNumber(payload, [
     "readiness.socialScore",
     "readiness.pillars.social",
+    "readiness.pillarScores.social",
     "esgScores.social"
   ]);
 
   const governanceScore = getNumber(payload, [
     "readiness.governanceScore",
     "readiness.pillars.governance",
+    "readiness.pillarScores.governance",
     "esgScores.governance"
   ]);
 
@@ -123,56 +139,34 @@ function validateEsgPayload(payload) {
   const energyRatio = getNumber(payload, [
     "energy.energyTransitionRatioPercent",
     "energy.transitionRatioPercent",
-    "energy.energyRatio"
+    "energy.energyRatio",
+    "technicalValidation.energyRatio"
   ]);
 
-  if (!organisation) {
-    return { ok: false, message: "Missing organisation." };
-  }
-
-  if (!segment) {
-    return { ok: false, message: "Missing aerospace segment." };
-  }
-
+  if (!organisation) return { ok: false, message: "Missing organisation." };
+  if (!segment) return { ok: false, message: "Missing aerospace segment." };
   if (!["2030", "2035", "2040", "2050"].includes(milestoneYear)) {
     return { ok: false, message: "Invalid milestone year." };
   }
 
-  if (!isNum(readinessIndex) || readinessIndex < 0 || readinessIndex > 100) {
-    return { ok: false, message: "Invalid readiness index." };
+  const checks = [
+    ["readiness index", readinessIndex, 0, 100],
+    ["environmental score", environmentalScore, 0, 100],
+    ["social score", socialScore, 0, 100],
+    ["governance score", governanceScore, 0, 100],
+    ["net emissions", netEmissions, 0, Infinity],
+    ["carbon Gt", carbonGt, 0, Infinity],
+    ["SBTi delta", sbtiDelta, -Infinity, Infinity],
+    ["MJ energy ratio", energyRatio, 0, Infinity]
+  ];
+
+  for (const [name, value, min, max] of checks) {
+    if (typeof value !== "number" || value < min || value > max) {
+      return { ok: false, message: `Invalid ${name}.` };
+    }
   }
 
-  if (!maturity) {
-    return { ok: false, message: "Missing maturity rating." };
-  }
-
-  if (!isNum(environmentalScore) || environmentalScore < 0 || environmentalScore > 100) {
-    return { ok: false, message: "Invalid environmental score." };
-  }
-
-  if (!isNum(socialScore) || socialScore < 0 || socialScore > 100) {
-    return { ok: false, message: "Invalid social score." };
-  }
-
-  if (!isNum(governanceScore) || governanceScore < 0 || governanceScore > 100) {
-    return { ok: false, message: "Invalid governance score." };
-  }
-
-  if (!isNum(netEmissions) || netEmissions < 0) {
-    return { ok: false, message: "Invalid net emissions." };
-  }
-
-  if (!isNum(carbonGt) || carbonGt < 0) {
-    return { ok: false, message: "Invalid carbon Gt value." };
-  }
-
-  if (!isNum(sbtiDelta)) {
-    return { ok: false, message: "Invalid SBTi delta." };
-  }
-
-  if (!isNum(energyRatio) || energyRatio < 0) {
-    return { ok: false, message: "Invalid MJ energy ratio." };
-  }
+  if (!maturity) return { ok: false, message: "Missing maturity rating." };
 
   return {
     ok: true,
@@ -204,22 +198,13 @@ function extractJson(text) {
     return JSON.parse(raw);
   } catch {}
 
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) {
-    try {
-      return JSON.parse(fenced[1].trim());
-    } catch {}
-  }
-
   const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) {
-    throw new Error("AI response was not valid JSON.");
-  }
+  if (!match) throw new Error("AI response was not valid JSON.");
 
   return JSON.parse(match[0]);
 }
 
-function normalizeAiOutput(data) {
+function normalizeOutput(data) {
   const strategicInterpretation =
     typeof data.strategicInterpretation === "string"
       ? data.strategicInterpretation
@@ -273,23 +258,20 @@ function normalizeAiOutput(data) {
   };
 }
 
-function hasWrongPositiveSbtiLanguage(aiOutput) {
-  const text = JSON.stringify(aiOutput).toLowerCase();
+function hasWrongPositiveSbtiLanguage(output) {
+  const text = JSON.stringify(output).toLowerCase();
 
-  const badPhrases = [
+  return [
     "sbti gap",
     "behind the selected",
     "behind milestone",
-    "behind the milestone",
     "shortfall",
     "insufficient decarbonisation",
     "insufficient decarbonization",
     "decarbonisation gap",
     "decarbonization gap",
     "below the milestone"
-  ];
-
-  return badPhrases.some((phrase) => text.includes(phrase));
+  ].some((phrase) => text.includes(phrase));
 }
 
 function buildFallback(payload, v, reason = "Safe fallback used.") {
@@ -351,10 +333,10 @@ function buildFallback(payload, v, reason = "Safe fallback used.") {
   };
 }
 
-function repairIfNeeded(ai, payload, v) {
-  const result = normalizeAiOutput(ai);
+function repairIfNeeded(output, payload, v) {
+  const clean = normalizeOutput(output);
 
-  if (v.sbtiStatus === "ahead" && v.sbtiDelta >= 0 && hasWrongPositiveSbtiLanguage(result)) {
+  if (v.sbtiStatus === "ahead" && v.sbtiDelta >= 0 && hasWrongPositiveSbtiLanguage(clean)) {
     return buildFallback(
       payload,
       v,
@@ -362,7 +344,7 @@ function repairIfNeeded(ai, payload, v) {
     );
   }
 
-  const policyText = result.policyAlignment.join(" ").toLowerCase();
+  const policyText = clean.policyAlignment.join(" ").toLowerCase();
 
   const required = [
     ["MITI i-ESG Phase 1", "miti"],
@@ -373,14 +355,14 @@ function repairIfNeeded(ai, payload, v) {
 
   for (const [label, key] of required) {
     if (!policyText.includes(key)) {
-      result.policyAlignment.push(`${label}: used as policy-alignment framing, not official certification.`);
+      clean.policyAlignment.push(`${label}: used as policy-alignment framing, not official certification.`);
     }
   }
 
-  result.policyAlignment = result.policyAlignment.slice(0, 4);
-  result.judgeExplanation = result.strategicInterpretation;
+  clean.policyAlignment = clean.policyAlignment.slice(0, 4);
+  clean.judgeExplanation = clean.strategicInterpretation;
 
-  return result;
+  return clean;
 }
 
 const DEVELOPER_PROMPT = `
@@ -424,7 +406,7 @@ Use this exact shape:
 `;
 
 export default async function handler(req, res) {
-  setCors(req, res);
+  setCors(res);
 
   if (req.method === "OPTIONS") {
     return res.status(204).end();
@@ -437,7 +419,7 @@ export default async function handler(req, res) {
     });
   }
 
-  const validation = validateEsgPayload(req.body || {});
+  const validation = validatePayload(req.body || {});
 
   if (!validation.ok) {
     return res.status(400).json({
@@ -483,7 +465,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(safe);
   } catch (error) {
-    console.error("ESG advisor error:", error);
+    console.error("ESG validator error:", error);
 
     const fallback = buildFallback(
       payload,
